@@ -1,0 +1,35 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run dev",
+    "devPath": "http://localhost:5173",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Remote Support Agent",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "windows": [
+      {
+        "title": "Remote Support Agent",
+        "width": 1100,
+        "height": 760,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' ws: wss: http: https:; media-src 'self' blob:;"
+    },
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.example.remote-support-agent",
+      "icon": [
+        "icons/icon.ico",
+        "icons/icon.png",
+        "icons/icon.icns"
+      ]
+    }
+  }
+}
