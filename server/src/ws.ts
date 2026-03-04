@@ -225,7 +225,7 @@ export const setupWebSocket = (server: http.Server) => {
       sendPeerStatusToSocket(
         session.sessionId,
         otherSocket(payload),
-        payload.role,
+        payload.role === "agent" ? "agent" : "controller",
         false
       );
       logger.info({ msg: "ws_disconnected", role: payload.role, sessionId: session.sessionId });

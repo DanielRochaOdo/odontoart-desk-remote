@@ -4,7 +4,7 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
-import pinoHttp from "pino-http";
+import { pinoHttp } from "pino-http";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { hashPassword, issueToken, passwordMatches, requireAnyAuth, requireAuth } from "./auth.js";
@@ -17,7 +17,7 @@ app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: "1mb" }));
-app.use(pinoHttp({ logger }));
+app.use(pinoHttp({ logger: logger as any }));
 
 process.on("unhandledRejection", (reason) => {
   logger.error({ msg: "unhandled_rejection", reason });
@@ -100,7 +100,8 @@ app.post("/sessions/create", (req, res) => {
     typeof agentName === "string" && agentName.trim().length > 0
       ? agentName.trim().slice(0, 80)
       : undefined;
-  const session = sessionStore.createSession(agentId, safeName, req.ip, preferredCode);
+  const createdByIp = req.ip ?? req.socket?.remoteAddress ?? "unknown";
+  const session = sessionStore.createSession(agentId, safeName, createdByIp, preferredCode);
   const agentToken = issueToken(
     { sub: agentId, role: "agent", sessionId: session.sessionId, agentId },
     config.SESSION_TOKEN_TTL_MIN
@@ -133,16 +134,17 @@ app.post("/sessions/join", requireAuth(["technician"]), (req, res) => {
     return res.status(400).json({ error: joined.reason });
   }
   const session = joined.session;
-  session.controllerUserId = (req as any).auth?.sub ?? "unknown";
+  const controllerUserId = (req as any).auth?.sub ?? "unknown";
+  session.controllerUserId = controllerUserId;
   const controllerToken = issueToken(
-    { sub: session.controllerUserId, role: "controller", sessionId: session.sessionId, agentId },
+    { sub: controllerUserId, role: "controller", sessionId: session.sessionId, agentId: session.agentId },
     config.CONTROLLER_TOKEN_TTL_MIN
   );
   logger.info({
     msg: "session_joined",
     sessionId: session.sessionId,
-    agentId,
-    controllerUserId: session.controllerUserId,
+    agentId: session.agentId,
+    controllerUserId,
     ip: req.ip
   });
   return res.json({
