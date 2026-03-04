@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { login, listSessions, joinSession, endSession } from "./lib/api";
 import { connectSignaling, type WsMessage } from "./lib/signaling";
 import { createPeerConnection } from "./lib/webrtc";
+import { isTauri } from "./lib/tauri";
 
 interface AuthState {
   token: string;
@@ -34,14 +35,26 @@ export default function App() {
   const [remoteScreen, setRemoteScreen] = useState<{ width: number; height: number } | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [fileTransferAllowed, setFileTransferAllowed] = useState(false);
+  const [fileTransferStatus, setFileTransferStatus] = useState("");
   const [accessFlowRequested, setAccessFlowRequested] = useState(false);
   const [peerOnline, setPeerOnline] = useState(false);
   const [viewMode, setViewMode] = useState<"dashboard" | "viewer">("dashboard");
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const fileChannelRef = useRef<RTCDataChannel | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const authRef = useRef<AuthState | null>(null);
   const accessFlowRequestedRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const lastIceRestartRef = useRef(0);
+  const incomingFileRef = useRef<{
+    id: string;
+    name: string;
+    size: number;
+    mime: string;
+    received: number;
+    chunks: Uint8Array[];
+  } | null>(null);
 
   useEffect(() => {
     const stored = localStorage.getItem("auth");
@@ -126,6 +139,7 @@ export default function App() {
     setAuth(null);
     localStorage.removeItem("auth");
     setSessions([]);
+    setFileTransferStatus("");
     setViewMode("dashboard");
   };
 
@@ -137,6 +151,8 @@ export default function App() {
 
       dataChannelRef.current?.close();
       dataChannelRef.current = null;
+      fileChannelRef.current?.close();
+      fileChannelRef.current = null;
       peerRef.current = null;
       peer?.close();
       setPeer(null);
@@ -150,6 +166,7 @@ export default function App() {
       setSessionId(null);
       setControlAllowed(false);
       setFileTransferAllowed(false);
+      setFileTransferStatus("");
       setRemoteScreen(null);
       setAccessFlowRequested(false);
       setPeerOnline(false);
@@ -240,11 +257,13 @@ export default function App() {
               return;
             case "file_transfer_accepted":
               setFileTransferAllowed(true);
-              setStatus("Transferencia permitida (nao implementada)");
+              setStatus("Transferencia permitida");
+              setFileTransferStatus("Transferencia de arquivos permitida");
               return;
             case "file_transfer_denied":
               setFileTransferAllowed(false);
               setStatus("Transferencia negada");
+              setFileTransferStatus("");
               return;
             case "session_end":
               setAccessFlowRequested(false);
@@ -297,18 +316,69 @@ export default function App() {
         peerRef.current.close();
       }
       const pc = createPeerConnection();
+      pc.addTransceiver("video", { direction: "recvonly" });
       peerRef.current = pc;
       pc.ontrack = (event) => {
-        const [remoteStream] = event.streams;
-        setRemoteStream(remoteStream);
+        const stream = event.streams[0] ?? new MediaStream([event.track]);
+        setRemoteStream(stream);
         if (videoRef.current) {
-          videoRef.current.srcObject = remoteStream;
+          videoRef.current.srcObject = stream;
           videoRef.current.muted = true;
           void videoRef.current.play().catch(() => {});
         }
       };
       pc.ondatachannel = (event) => {
-        dataChannelRef.current = event.channel;
+        if (event.channel.label === "control") {
+          dataChannelRef.current = event.channel;
+        } else if (event.channel.label === "file") {
+          const channel = event.channel;
+          fileChannelRef.current = channel;
+          channel.binaryType = "arraybuffer";
+          channel.onmessage = (msg) => {
+            if (typeof msg.data === "string") {
+              try {
+                const payload = JSON.parse(msg.data);
+                if (payload?.type === "file_meta") {
+                  incomingFileRef.current = {
+                    id: payload.id,
+                    name: payload.name,
+                    size: payload.size,
+                    mime: payload.mime || "application/octet-stream",
+                    received: 0,
+                    chunks: []
+                  };
+                  setFileTransferStatus(`Recebendo ${payload.name}...`);
+                }
+                if (payload?.type === "file_end" && incomingFileRef.current) {
+                  const incoming = incomingFileRef.current;
+                  const blob = new Blob(incoming.chunks, { type: incoming.mime });
+                  const url = URL.createObjectURL(blob);
+                  const link = document.createElement("a");
+                  link.href = url;
+                  link.download = incoming.name || `arquivo-${incoming.id}`;
+                  link.click();
+                  URL.revokeObjectURL(url);
+                  setFileTransferStatus(`Arquivo recebido: ${incoming.name}`);
+                  incomingFileRef.current = null;
+                }
+              } catch {
+                // ignore
+              }
+              return;
+            }
+            if (msg.data instanceof ArrayBuffer && incomingFileRef.current) {
+              const chunk = new Uint8Array(msg.data);
+              incomingFileRef.current.chunks.push(chunk);
+              incomingFileRef.current.received += chunk.byteLength;
+              const received = incomingFileRef.current.received;
+              const total = incomingFileRef.current.size;
+              if (total > 0) {
+                const percent = Math.min(100, Math.round((received / total) * 100));
+                setFileTransferStatus(`Recebendo ${incomingFileRef.current.name}... ${percent}%`);
+              }
+            }
+          };
+        }
       };
       pc.onicecandidate = (event) => {
         if (event.candidate) {
@@ -316,7 +386,20 @@ export default function App() {
         }
       };
       pc.onconnectionstatechange = () => {
-        if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+          const now = Date.now();
+          if (now - lastIceRestartRef.current > 5000 && typeof pc.restartIce === "function") {
+            lastIceRestartRef.current = now;
+            try {
+              pc.restartIce();
+              setStatus("Reconectando midia...");
+              return;
+            } catch {
+              // fallthrough
+            }
+          }
+        }
+        if (pc.connectionState === "closed") {
           cleanupSession(false);
         }
       };
@@ -336,6 +419,73 @@ export default function App() {
     setAccessFlowRequested(true);
     connection.send({ type: "request_share", payload: { fromUserId: auth.user.id } });
     setStatus(peerOnline ? "Solicitando acesso..." : "Solicitacao enviada (aguardando agente)");
+  };
+
+  const sendFile = useCallback(
+    async (file: File) => {
+      if (!peerRef.current) {
+        setFileTransferStatus("Sem conexao para envio");
+        return;
+      }
+      if (!fileTransferAllowed) {
+        setFileTransferStatus("Transferencia nao permitida");
+        return;
+      }
+      let channel = fileChannelRef.current;
+      if (!channel || channel.readyState === "closed") {
+        channel = peerRef.current.createDataChannel("file");
+        channel.binaryType = "arraybuffer";
+        fileChannelRef.current = channel;
+      }
+
+      if (channel.readyState !== "open") {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = window.setTimeout(() => reject(new Error("file_channel_timeout")), 10_000);
+          channel?.addEventListener("open", () => {
+            clearTimeout(timeout);
+            resolve();
+          }, { once: true });
+          channel?.addEventListener("close", () => {
+            clearTimeout(timeout);
+            reject(new Error("file_channel_closed"));
+          }, { once: true });
+        });
+      }
+
+      const id = (crypto as any).randomUUID ? crypto.randomUUID() : `file-${Date.now()}`;
+      const mime = file.type || "application/octet-stream";
+      channel.send(JSON.stringify({ type: "file_meta", id, name: file.name, size: file.size, mime }));
+      setFileTransferStatus(`Enviando ${file.name}...`);
+
+      const chunkSize = 16 * 1024;
+      let offset = 0;
+      channel.bufferedAmountLowThreshold = 512 * 1024;
+      while (offset < file.size) {
+        const slice = file.slice(offset, offset + chunkSize);
+        const buffer = await slice.arrayBuffer();
+        channel.send(buffer);
+        offset += buffer.byteLength;
+        if (channel.bufferedAmount > 2 * 1024 * 1024) {
+          await new Promise<void>((resolve) => {
+            const handler = () => {
+              channel?.removeEventListener("bufferedamountlow", handler);
+              resolve();
+            };
+            channel?.addEventListener("bufferedamountlow", handler);
+          });
+        }
+      }
+      channel.send(JSON.stringify({ type: "file_end", id }));
+      setFileTransferStatus(`Arquivo enviado: ${file.name}`);
+    },
+    [fileTransferAllowed]
+  );
+
+  const handleFileSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    await sendFile(file);
+    event.target.value = "";
   };
 
   const sendInput = useCallback(
@@ -406,6 +556,19 @@ export default function App() {
     return sessionId.slice(0, 8);
   }, [sessionId]);
 
+  if (!isTauri()) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-obsidian via-plum to-obsidian p-8">
+        <div className="panel mx-auto max-w-md rounded-3xl p-8">
+          <h1 className="text-3xl font-semibold text-cloud">Remote Support Controller</h1>
+          <p className="mt-2 text-mist">
+            Este aplicativo funciona apenas no modo desktop (Tauri). Execute pelo instalador.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   if (!auth) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-obsidian via-plum to-obsidian p-8">
@@ -460,6 +623,7 @@ export default function App() {
             <p className="text-xs text-mist">
               Sessao: {sessionLabel} | Status: {status} | Agente: {peerOnline ? "online" : "offline"} | Controle: {controlAllowed ? "ON" : "OFF"}
             </p>
+            {fileTransferStatus && <p className="mt-1 text-xs text-mist">{fileTransferStatus}</p>}
           </div>
           <div className="flex flex-wrap gap-3">
             <button
@@ -467,6 +631,14 @@ export default function App() {
               onClick={requestAccess}
             >
               Solicitar acesso
+            </button>
+            <button
+              className="rounded-lg border border-cloud/40 px-4 py-2 text-cloud"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!fileTransferAllowed}
+              title={fileTransferAllowed ? "Enviar arquivo" : "Transferencia nao permitida"}
+            >
+              Enviar arquivo
             </button>
             <button
               className="rounded-lg bg-ember px-4 py-2 font-semibold text-obsidian"
@@ -479,9 +651,11 @@ export default function App() {
 
         {fileTransferAllowed && (
           <div className="absolute bottom-4 left-4 rounded-lg bg-obsidian/80 px-3 py-2 text-xs text-mist backdrop-blur">
-            Transferencia permitida, mas funcionalidade nao implementada.
+            Transferencia permitida.
           </div>
         )}
+
+        <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileSelected} />
       </div>
     );
   }
@@ -569,10 +743,19 @@ export default function App() {
               >
                 Solicitar acesso
               </button>
+              <button
+                className="rounded-lg border border-cloud/40 px-4 py-2 text-cloud"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={!fileTransferAllowed}
+                title={fileTransferAllowed ? "Enviar arquivo" : "Transferencia nao permitida"}
+              >
+                Enviar arquivo
+              </button>
             </div>
             <div className="mt-4 text-sm text-mist">
               Sessao: {sessionLabel} | Status: {status} | Agente: {peerOnline ? "online" : "offline"} | Controle: {controlAllowed ? "ON" : "OFF"}
             </div>
+            {fileTransferStatus && <p className="mt-2 text-xs text-mist">{fileTransferStatus}</p>}
           </section>
         </div>
 
@@ -590,6 +773,8 @@ export default function App() {
             Quando o Agent aceitar o compartilhamento, a tela remota abre automaticamente em modo dedicado.
           </p>
         </section>
+
+        <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileSelected} />
       </div>
     </div>
   );
